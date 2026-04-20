@@ -20,4 +20,4 @@ RUN chmod +x /docker-entrypoint.sh
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 # Activity/trades feed copy (matches what you see in wallet activity). For position-sync only: cli run
-CMD ["python", "-m", "polymarket_copy_bot.activity_runner", "run"]
+CMD ["python", "-m", "polymarket_copy_bot.activity_runner", "run", "--limit", "50"]

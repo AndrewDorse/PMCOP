@@ -1,5 +1,5 @@
-# Default image follows wallet ACTIVITY (same as Polymarket activity tab), not position-sync only.
-# To use position sync instead, set: command: ["python","-m","polymarket_copy_bot.cli","run"]
+# Default: activity_runner run --limit 50 (last 50 deals per wallet per cycle; dedupe via state cache).
+# Position-sync only: command: ["python","-m","polymarket_copy_bot.cli","run"]
 #
 # Deploy: copy .env.example -> .env, fill secrets, then:
 #   docker compose up -d --build

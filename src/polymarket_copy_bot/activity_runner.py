@@ -110,7 +110,7 @@ class PublicActivityApi:
         resp.raise_for_status()
         return resp.json()
 
-    def get_recent_activity(self, wallet: str, limit: int = 20) -> List[dict]:
+    def get_recent_activity(self, wallet: str, limit: int = 50) -> List[dict]:
         queries = [
             {"user": wallet, "limit": limit, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
             {"wallet": wallet, "limit": limit, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
@@ -474,7 +474,7 @@ class MarketActivityTracker:
             return None
         return ClosedPositionItem(asset=asset, title=title, outcome=outcome, realized_pnl=realized_pnl, timestamp=timestamp, avg_price=avg_price)
 
-    def fetch_recent_wallet_activity(self, wallet: str, limit: int = 20) -> List[ActivityTrade]:
+    def fetch_recent_wallet_activity(self, wallet: str, limit: int = 50) -> List[ActivityTrade]:
         raw_activity = self.api.get_recent_activity(wallet, limit=limit)
         items: List[ActivityTrade] = []
         seen_ids: set[str] = set()
@@ -642,7 +642,7 @@ class MarketActivityTracker:
         cache["tp_log"] = tp_log
         self._save_cache(cache)
 
-    def cycle(self, limit: int = 20) -> None:
+    def cycle(self, limit: int = 50) -> None:
         wallets = self.load_watch_wallets()
         if not wallets:
             raise RuntimeError("Watch list is empty. Add at least one wallet first.")
@@ -717,7 +717,7 @@ class MarketActivityTracker:
         self._save_cache(cache)
         self.place_tp_orders(cache=cache)
 
-    def loop(self, limit: int = 20, clear_cache_on_start: bool = False) -> None:
+    def loop(self, limit: int = 50, clear_cache_on_start: bool = False) -> None:
         wallets = self.load_watch_wallets()
         if clear_cache_on_start:
             self.clear_cache()
@@ -736,7 +736,7 @@ class MarketActivityTracker:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Polymarket activity-based copy trader")
     parser.add_argument("command", choices=["once", "run"], help="Run one cycle or loop forever")
-    parser.add_argument("--limit", type=int, default=20, help="How many recent /activity items per wallet to fetch")
+    parser.add_argument("--limit", type=int, default=50, help="How many recent /activity items per wallet to fetch")
     return parser
 
 
