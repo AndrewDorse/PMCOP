@@ -27,9 +27,9 @@ except Exception:
 
 USDC_DECIMALS = 1_000_000
 
-# Activity-copy market buys (overridable via COPY_BALANCE_PCT / MIN_MARKET_COPY_USD)
-DEFAULT_COPY_BALANCE_PCT = 0.01
-DEFAULT_MIN_MARKET_COPY_USD = 1.0
+# Market FOK copy size: max($3, 2% of USDC balance), capped at balance.
+COPY_BALANCE_FRACTION = 0.02
+MIN_MARKET_COPY_USD = 3.0
 IGNORE_IF_ALREADY_IN_POSITION = True
 CLEAR_CACHE_ON_RUN_START = True
 
@@ -517,15 +517,12 @@ class MarketActivityTracker:
         return max(0.0, self._extract_usdc_balance(payload))
 
     def get_copy_buy_usd(self) -> float:
-        """FOK market BUY notional: max(MIN_USD, pct * balance), capped at balance (typically $1 min, 1% when larger)."""
+        """max($3, 2% * balance), never more than balance."""
         balance = self.get_available_usdc_balance()
-        pct_frac = float(os.getenv("COPY_BALANCE_PCT", str(DEFAULT_COPY_BALANCE_PCT)))
-        min_usd = float(os.getenv("MIN_MARKET_COPY_USD", str(DEFAULT_MIN_MARKET_COPY_USD)))
-        if balance < min_usd:
-            self._debug("Insufficient collateral for minimum market copy", {"balance": balance, "min_usd": min_usd})
+        if balance < MIN_MARKET_COPY_USD:
+            self._debug("Insufficient USDC for $3 copy", {"balance": balance})
             return 0.0
-        pct_amount = balance * pct_frac
-        amount = max(min_usd, pct_amount)
+        amount = max(MIN_MARKET_COPY_USD, balance * COPY_BALANCE_FRACTION)
         amount = min(amount, balance)
         return int(amount * 100) / 100.0
 
@@ -534,7 +531,7 @@ class MarketActivityTracker:
 
     def repeat_trade(self, trade: ActivityTrade, copy_buy_usd: float) -> dict:
         if copy_buy_usd <= 0:
-            return {"ok": False, "message": "skipped: insufficient USDC for minimum market copy (see MIN_MARKET_COPY_USD)"}
+            return {"ok": False, "message": "skipped: need at least $3 USDC for copy"}
         if self.settings.dry_run:
             order_args = self._build_market_order(trade, copy_buy_usd)
             return {"ok": True, "message": f"DRY_RUN would place market BUY for {trade.title} / {trade.outcome}", "copied_usd": copy_buy_usd, "order_args": {"token_id": order_args.token_id, "amount": order_args.amount, "side": order_args.side, "order_type": str(order_args.order_type)}}
