@@ -1,0 +1,17 @@
+# Deploy: copy .env.example -> .env, fill secrets, then:
+#   docker compose up -d --build
+#
+# State (watch cache, logs) persists in the named volume.
+
+services:
+  polymarket-copy-bot:
+    build: .
+    container_name: polymarket-copy-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - polymarket_state:/app/state
+
+volumes:
+  polymarket_state:
