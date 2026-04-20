@@ -38,8 +38,8 @@ TP_SIZE_FACTOR = 0.98
 TP_CHECK_INTERVAL_SECONDS = 60
 DEBUG_LOG_FILENAME = "activity_runner.log"
 
-# Allowed only these crypto families
-ALLOWED_CRYPTO_TOKENS = ("btc", "bitcoin", "eth", "ethereum", "ether", "sol", "solana", "xtp", "tap")
+# Strict 5m/15m “Up or Down” window filter (subset of crypto activity)
+ALLOWED_CRYPTO_TOKENS = ("btc", "bitcoin", "eth", "ethereum", "ether", "sol", "solana", "xtp", "tap", "xrp", "doge", "bnb", "hype")
 
 # Same market + same outcome rules
 MAX_SAME_DIRECTION_ENTRIES_PER_MARKET = 2
@@ -374,11 +374,37 @@ class MarketActivityTracker:
         return window in (5, 15)
 
     def _is_fresh_trade(self, trade: ActivityTrade) -> bool:
-        return abs(int(time.time()) - trade.timestamp) <= 120
+        max_age = int(os.getenv("ACTIVITY_MAX_AGE_SECONDS", "3600"))
+        return abs(int(time.time()) - trade.timestamp) <= max_age
 
     def _is_active_title(self, title: str) -> bool:
         end_dt = self._market_end_et_from_title(title)
-        return end_dt is not None and end_dt > self._now_et()
+        if end_dt is None:
+            return True
+        return end_dt > self._now_et()
+
+    def _is_crypto_activity_title(self, title: str) -> bool:
+        """Copy BUYs on strict window markets OR any market title mentioning major crypto (not only 5m/15m up/down)."""
+        if self._is_crypto_window_title(title):
+            return True
+        low = title.lower()
+        keywords = (
+            "bitcoin",
+            "btc",
+            "ethereum",
+            "solana",
+            "dogecoin",
+            "doge",
+            "xrp",
+            "ripple",
+            "bnb",
+            "binance",
+            "hype",
+            "cardano",
+            "polygon",
+            "matic",
+        )
+        return any(k in low for k in keywords)
 
     def _can_open_same_outcome(self, cache: dict, title: str, outcome: str) -> tuple[bool, str]:
         entries = cache.get("market_outcome_entries", {})
@@ -581,7 +607,7 @@ class MarketActivityTracker:
         self._last_tp_check_ts = now_ts
 
         positions = self.fetch_own_positions()
-        active_positions = [p for p in positions if self._is_crypto_window_title(p.title) and self._is_active_title(p.title)]
+        active_positions = [p for p in positions if self._is_crypto_activity_title(p.title) and self._is_active_title(p.title)]
 
         if cache is None:
             cache = self._load_cache()
@@ -632,9 +658,9 @@ class MarketActivityTracker:
             trades = self.fetch_recent_wallet_activity(wallet, limit=limit)
             self._debug("Fetched activity", {"wallet": wallet, "count": len(trades)})
             for trade in trades:
-                if not self._is_crypto_window_title(trade.title):
-                    continue
                 if trade.dedupe_key in seen:
+                    continue
+                if not self._is_crypto_activity_title(trade.title):
                     continue
                 if not self._is_fresh_trade(trade):
                     continue

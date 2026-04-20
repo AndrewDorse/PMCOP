@@ -1,3 +1,6 @@
+# Default image follows wallet ACTIVITY (same as Polymarket activity tab), not position-sync only.
+# To use position sync instead, set: command: ["python","-m","polymarket_copy_bot.cli","run"]
+#
 # Deploy: copy .env.example -> .env, fill secrets, then:
 #   docker compose up -d --build
 #
