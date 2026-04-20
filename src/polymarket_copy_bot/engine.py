@@ -320,13 +320,7 @@ class CopyTradingEngine:
 
             delta = target - own
             ref_price = meta.cur_price or meta.avg_price or 0.5
-            notional = abs(delta) * ref_price
-
-            if abs(delta) < self.settings.min_delta_shares:
-                skipped.append(f"{asset}: delta {delta:.4f} below MIN_DELTA_SHARES")
-                continue
-            if notional < self.settings.min_notional_usd:
-                skipped.append(f"{asset}: notional ${notional:.4f} below MIN_NOTIONAL_USD")
+            if abs(delta) < 1e-9:
                 continue
 
             max_size_by_order = self.settings.max_single_order_usd / max(ref_price, 1e-9)
