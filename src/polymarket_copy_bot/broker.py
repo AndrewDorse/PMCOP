@@ -98,17 +98,27 @@ class Broker:
         return self._extract_level_price(levels[0])
 
     def _market_price_for_instruction(self, inst: TradeInstruction) -> float:
-        try:
-            book = self.client.get_order_book(inst.asset)
-        except Exception as exc:
-            raise RuntimeError(f"could not fetch orderbook for token {inst.asset}: {exc}")
-
-        book_price = self._best_book_price(book, inst.side)
-        if book_price is None:
-            raise RuntimeError(f"no usable orderbook price for token {inst.asset}")
-
         bps = self.settings.buy_slippage_bps if inst.side == "BUY" else self.settings.sell_slippage_bps
         mult = 1 + (bps / 10000.0) if inst.side == "BUY" else 1 - (bps / 10000.0)
+
+        book_price: float | None = None
+        try:
+            book = self.client.get_order_book(inst.asset)
+            book_price = self._best_book_price(book, inst.side)
+        except Exception:
+            book_price = None
+
+        if book_price is None:
+            ref = float(inst.ref_price or 0.0)
+            if 0.001 < ref < 0.999:
+                self.console.print(
+                    f"[yellow]orderbook missing/empty for {inst.asset}; "
+                    f"using Data API ref_price {ref:.4f}[/yellow]"
+                )
+                book_price = ref
+            else:
+                raise RuntimeError(f"no usable orderbook price for token {inst.asset}")
+
         return max(0.001, min(0.999, book_price * mult))
 
     def place_instruction(self, inst: TradeInstruction) -> OrderResult:
