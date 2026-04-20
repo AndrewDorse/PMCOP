@@ -17,8 +17,8 @@ class Settings(BaseModel):
 
     poll_interval_seconds: int = Field(default=8)
     copy_ratio: float = Field(default=1.0)
-    min_delta_shares: float = Field(default=1.0)
-    min_notional_usd: float = Field(default=1.0)
+    min_delta_shares: float = Field(default=0.2)
+    min_notional_usd: float = Field(default=0.5)
     buy_slippage_bps: int = Field(default=200)
     sell_slippage_bps: int = Field(default=200)
     max_single_order_usd: float = Field(default=100.0)
@@ -52,8 +52,8 @@ class Settings(BaseModel):
             pm_signature_type=int(os.getenv("PM_SIGNATURE_TYPE", "1")),
             poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "8")),
             copy_ratio=float(os.getenv("COPY_RATIO", "1.0")),
-            min_delta_shares=float(os.getenv("MIN_DELTA_SHARES", "1.0")),
-            min_notional_usd=float(os.getenv("MIN_NOTIONAL_USD", "1.0")),
+            min_delta_shares=float(os.getenv("MIN_DELTA_SHARES", "0.2")),
+            min_notional_usd=float(os.getenv("MIN_NOTIONAL_USD", "0.5")),
             buy_slippage_bps=int(os.getenv("BUY_SLIPPAGE_BPS", "200")),
             sell_slippage_bps=int(os.getenv("SELL_SLIPPAGE_BPS", "200")),
             max_single_order_usd=float(os.getenv("MAX_SINGLE_ORDER_USD", "100.0")),
