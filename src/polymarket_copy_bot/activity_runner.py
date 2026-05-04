@@ -242,6 +242,49 @@ class MarketActivityTracker:
         else:
             self.logger.info("%s | %s", message, json.dumps(payload, ensure_ascii=False))
 
+    def _log_copy_deal(self, trade: ActivityTrade, *, copied_usd: float, dry_run: bool, response: Any = None) -> None:
+        payload = {
+            "event": "COPY_DEAL",
+            "dry_run": dry_run,
+            "source_wallet": trade.wallet,
+            "title": trade.title,
+            "outcome": trade.outcome,
+            "asset": trade.asset,
+            "copied_usd": copied_usd,
+            "source_tx": trade.tx_hash or None,
+            "source_key": trade.dedupe_key,
+        }
+        if response is not None and not dry_run:
+            try:
+                payload["response"] = self._to_serializable_response(response)
+            except Exception:
+                payload["response"] = str(response)[:2000]
+        self.logger.info("COPY_DEAL | %s", json.dumps(payload, ensure_ascii=False))
+
+    def _to_serializable_response(self, value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            try:
+                return json.loads(json.dumps(value, default=str)[:4000])
+            except Exception:
+                return str(value)[:2000]
+        return str(value)[:2000]
+
+    def _log_error(self, event: str, message: str, *, payload: Optional[dict] = None, exc: Optional[BaseException] = None) -> None:
+        extra = dict(payload or {})
+        extra["event"] = event
+        extra["message"] = message
+        line = f"{event} | {json.dumps(extra, ensure_ascii=False)}"
+        if exc is not None:
+            self.logger.error(
+                "%s | %s: %s",
+                line,
+                type(exc).__name__,
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        else:
+            self.logger.error("%s", line)
+
     def _compact(self, message: str) -> None:
         self.console.print(message)
 
@@ -566,6 +609,7 @@ class MarketActivityTracker:
             ok = False
             message = ""
             used_copy_usd = copy_buy_usd
+            result: dict = {}
 
             try:
                 result = self.repeat_trade(trade, copy_buy_usd)
@@ -574,6 +618,20 @@ class MarketActivityTracker:
                 used_copy_usd = float(result.get("copied_usd", copy_buy_usd))
             except Exception as exc:
                 message = f"error: {exc}"
+                result = {"ok": False, "message": message}
+                self._compact(f"[red]COPY_ORDER_FAILED[/red] {trade.title} | {exc}")
+                self._log_error(
+                    "COPY_ORDER_FAILED",
+                    str(exc),
+                    payload={
+                        "source_wallet": trade.wallet,
+                        "title": trade.title,
+                        "outcome": trade.outcome,
+                        "asset": trade.asset,
+                        "copied_usd": used_copy_usd,
+                    },
+                    exc=exc,
+                )
 
             repeated.append({"wallet": trade.wallet, "asset": trade.asset, "title": trade.title, "outcome": trade.outcome, "source_size": trade.size, "source_price": trade.price, "source_amount": trade.amount, "timestamp": trade.timestamp, "source_hash": trade.tx_hash, "source_key": trade.dedupe_key, "copied_usd": used_copy_usd, "result_ok": ok, "result_message": message})
 
@@ -582,6 +640,27 @@ class MarketActivityTracker:
                 cycle_bought_assets.add(trade.asset)
                 self._register_asset_buy_time(cache, trade.asset)
                 self._compact(f"[green]OPEN DEAL[/green] {trade.title} | {trade.outcome} | ${used_copy_usd:.2f}")
+                resp_obj = result.get("response") if isinstance(result, dict) else None
+                self._log_copy_deal(
+                    trade,
+                    copied_usd=used_copy_usd,
+                    dry_run=self.settings.dry_run,
+                    response=None if self.settings.dry_run else resp_obj,
+                )
+            elif not message.startswith("error:"):
+                self._compact(f"[yellow]COPY_SKIPPED[/yellow] {trade.title} | {message}")
+                self._log_error(
+                    "COPY_ORDER_SKIPPED",
+                    message,
+                    payload={
+                        "source_wallet": trade.wallet,
+                        "title": trade.title,
+                        "outcome": trade.outcome,
+                        "asset": trade.asset,
+                        "copied_usd": used_copy_usd,
+                        "result_ok": ok,
+                    },
+                )
 
             self._debug("Trade result", {"title": trade.title, "outcome": trade.outcome, "asset": trade.asset, "source_amount": trade.amount, "copied_usd": used_copy_usd, "ok": ok, "message": message})
 
@@ -600,8 +679,8 @@ class MarketActivityTracker:
             try:
                 self.cycle(limit=limit)
             except Exception as exc:
-                self._compact(f"[red]ERROR[/red] {exc}")
-                self._debug("Cycle error", {"error": str(exc)})
+                self._compact(f"[red]CYCLE_ERROR[/red] {exc}")
+                self._log_error("CYCLE_ERROR", str(exc), exc=exc)
             time.sleep(self.settings.poll_interval_seconds)
 
 
