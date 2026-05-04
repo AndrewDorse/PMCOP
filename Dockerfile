@@ -19,5 +19,5 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
-# Activity/trades feed copy (matches what you see in wallet activity). For position-sync only: cli run
+# Activity feed: copy all BUYs ($1 if balance ≤$200 else 0.75%), 15m cooldown per token; hold to resolution (no TP). Position-sync: cli run
 CMD ["python", "-m", "polymarket_copy_bot.activity_runner", "run", "--limit", "50"]

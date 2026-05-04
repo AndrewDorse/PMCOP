@@ -1,4 +1,4 @@
-# Default: activity_runner run --limit 50 (last 50 deals per wallet per cycle; dedupe via state cache).
+# Default: activity_runner run --limit 50 (copy BUYs; $1 or 0.75%; 15m per-asset cooldown; no take-profit — hold to resolution).
 # Position-sync only: command: ["python","-m","polymarket_copy_bot.cli","run"]
 #
 # Deploy: copy .env.example -> .env, fill secrets, then:
