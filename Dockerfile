@@ -9,6 +9,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -19,5 +20,6 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
-# Activity feed: copy all BUYs ($1 if balance ≤$200 else 0.75%), 15m cooldown per token; hold to resolution (no TP). Position-sync: cli run
+# activity_runner: PYTHONPATH=/app/src — module name is polymarket_copy_bot (not polymymarket_*).
+# Activity feed: copy BUYs ($1 / 0.75%), 15m cooldown; hold to resolution. Position-sync: cli run
 CMD ["python", "-m", "polymarket_copy_bot.activity_runner", "run", "--limit", "50"]

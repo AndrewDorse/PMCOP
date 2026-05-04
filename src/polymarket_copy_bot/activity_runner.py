@@ -98,24 +98,22 @@ class PublicActivityApi:
         return resp.json()
 
     def get_recent_activity(self, wallet: str, limit: int = 50) -> List[dict]:
-        queries = [
-            {"user": wallet, "limit": limit, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
-            {"wallet": wallet, "limit": limit, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
-            {"address": wallet, "limit": limit, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
-        ]
+        # Polymarket Data API only accepts `user` (see docs); other params return 400.
+        try:
+            data = self._get(
+                "/activity",
+                {"user": wallet, "limit": limit, "sortBy": "TIMESTAMP", "sortDirection": "DESC"},
+            )
+        except Exception:
+            return []
         items: List[dict] = []
-        for q in queries:
-            try:
-                data = self._get("/activity", q)
-            except Exception:
-                continue
-            if isinstance(data, list):
-                items.extend(x for x in data if isinstance(x, dict))
-            elif isinstance(data, dict):
-                for key in ("activity", "data", "items", "results"):
-                    value = data.get(key)
-                    if isinstance(value, list):
-                        items.extend(x for x in value if isinstance(x, dict))
+        if isinstance(data, list):
+            items.extend(x for x in data if isinstance(x, dict))
+        elif isinstance(data, dict):
+            for key in ("activity", "data", "items", "results"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    items.extend(x for x in value if isinstance(x, dict))
         return items
 
 
@@ -277,7 +275,15 @@ class MarketActivityTracker:
         return default
 
     def _normalize_side(self, raw: dict) -> str:
-        for candidate in (raw.get("side"), raw.get("tradeType"), raw.get("activityType"), raw.get("type"), raw.get("action"), raw.get("verb")):
+        for candidate in (
+            raw.get("side"),
+            raw.get("tradeType"),
+            raw.get("activityType"),
+            raw.get("orderSide"),
+            raw.get("takerSide"),
+            raw.get("action"),
+            raw.get("verb"),
+        ):
             value = str(candidate or "").strip().upper()
             if value in {"BUY", "SELL", "REDEEM"}:
                 return value
@@ -368,6 +374,10 @@ class MarketActivityTracker:
         size = self._to_float(raw.get("size") or raw.get("shares") or raw.get("amount"))
         price = self._to_float(raw.get("price") or raw.get("rate"))
         timestamp = self._to_int(raw.get("timestamp") or raw.get("time") or raw.get("createdAt") or raw.get("created_at"))
+        if timestamp > 10**12:
+            timestamp = timestamp // 1000
+        if price <= 0:
+            price = self._to_float(raw.get("avgPrice") or raw.get("avg_price") or raw.get("fillPrice"))
         if not title or not asset or size <= 0 or price <= 0 or timestamp <= 0:
             return None
         return ActivityTrade(wallet=wallet, asset=asset, title=title, outcome=outcome, side=side, size=size, price=price, timestamp=timestamp, amount=size * price, tx_hash=tx_hash, raw_id=raw_id)
@@ -508,17 +518,33 @@ class MarketActivityTracker:
         cycle_bought_assets: set[str] = set()
         candidates: List[ActivityTrade] = []
 
+        skip_ended_title = os.getenv("ACTIVITY_SKIP_ENDED_TITLE_FILTER", "true").lower() in {"1", "true", "yes", "y", "on"}
+
         for wallet in wallets:
             trades = self.fetch_recent_wallet_activity(wallet, limit=limit)
-            self._debug("Fetched activity", {"wallet": wallet, "count": len(trades)})
+            skipped_seen = skipped_fresh = skipped_title = 0
             for trade in trades:
                 if trade.dedupe_key in seen:
+                    skipped_seen += 1
                     continue
                 if not self._is_fresh_trade(trade):
+                    skipped_fresh += 1
                     continue
-                if not self._is_active_title(trade.title):
+                if not skip_ended_title and not self._is_active_title(trade.title):
+                    skipped_title += 1
                     continue
                 candidates.append(trade)
+            self._debug(
+                "Activity scan",
+                {
+                    "wallet": wallet,
+                    "parsed_buy_rows": len(trades),
+                    "skipped_seen": skipped_seen,
+                    "skipped_fresh": skipped_fresh,
+                    "skipped_ended_title": skipped_title,
+                    "skip_ended_title_filter": skip_ended_title,
+                },
+            )
 
         candidates.sort(key=lambda x: x.timestamp)
 
