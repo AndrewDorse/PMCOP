@@ -14,6 +14,10 @@ class Settings(BaseModel):
     pm_private_key: str
     pm_funder: str
     pm_signature_type: int = Field(default=1)
+    # Optional Polymarket builder / relayer API creds (see KNG4 prst1). If unset, derive_or_create API key is used.
+    pm_relayer_api_key: str = Field(default="")
+    pm_relayer_secret: str = Field(default="")
+    pm_relayer_passphrase: str = Field(default="")
 
     poll_interval_seconds: int = Field(default=8)
     copy_ratio: float = Field(default=1.0)
@@ -48,6 +52,9 @@ class Settings(BaseModel):
             pm_private_key=os.getenv("PM_PRIVATE_KEY", ""),
             pm_funder=os.getenv("PM_FUNDER", ""),
             pm_signature_type=int(os.getenv("PM_SIGNATURE_TYPE", "1")),
+            pm_relayer_api_key=(os.getenv("PM_RELAYER_API_KEY", "") or os.getenv("RELAYER_API_KEY", "")).strip(),
+            pm_relayer_secret=(os.getenv("PM_RELAYER_SECRET", "") or os.getenv("RELAYER_SECRET", "")).strip(),
+            pm_relayer_passphrase=(os.getenv("PM_RELAYER_PASSPHRASE", "") or os.getenv("RELAYER_PASSPHRASE", "")).strip(),
             poll_interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "8")),
             copy_ratio=float(os.getenv("COPY_RATIO", "1.0")),
             buy_slippage_bps=int(os.getenv("BUY_SLIPPAGE_BPS", "200")),

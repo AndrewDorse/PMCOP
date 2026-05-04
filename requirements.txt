@@ -1,4 +1,6 @@
 py-clob-client>=0.34.6
+# activity_runner live orders: v2 CLOB (FAK + tick/neg_risk + create_and_post_market_order), same stack as KNG4/prst1
+py_clob_client_v2>=1.0.0
 requests>=2.32.0
 python-dotenv>=1.0.1
 pydantic>=2.7.0

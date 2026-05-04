@@ -11,9 +11,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client_v2 import (
+    ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
+    ClobClient,
+    MarketOrderArgs,
+    OrderType,
+    PartialCreateOrderOptions,
+    Side,
+)
 from rich.console import Console
 
 from .config import Settings
@@ -25,8 +32,6 @@ try:
 except Exception:
     ET_TZ = timezone(timedelta(hours=-4))
 
-USDC_DECIMALS = 1_000_000
-
 # V2-style sizing: flat $1 when balance ≤ threshold; above threshold use 0.75% of balance (capped at balance).
 HIGH_BALANCE_COPY_THRESHOLD_USD = 200.0
 COPY_BALANCE_FRACTION_ABOVE_THRESHOLD = 0.0075  # 0.75%
@@ -37,6 +42,13 @@ CLEAR_CACHE_ON_RUN_START = True
 ASSET_BUY_COOLDOWN_SECONDS = 15 * 60
 
 DEBUG_LOG_FILENAME = "activity_runner.log"
+
+
+def _norm_tick(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    return s if s in {"0.1", "0.01", "0.001", "0.0001"} else None
 
 
 @dataclass
@@ -124,12 +136,25 @@ class MarketActivityTracker:
 
         self.client = ClobClient(
             settings.pm_host,
-            key=settings.pm_private_key,
             chain_id=settings.pm_chain_id,
+            key=settings.pm_private_key,
             signature_type=settings.pm_signature_type,
             funder=settings.pm_funder,
         )
-        self.client.set_api_creds(self.client.create_or_derive_api_creds())
+        rk = (settings.pm_relayer_api_key or "").strip()
+        if rk:
+            self.client.set_api_creds(
+                ApiCreds(
+                    api_key=rk,
+                    api_secret=(settings.pm_relayer_secret or "").strip(),
+                    api_passphrase=(settings.pm_relayer_passphrase or "").strip(),
+                )
+            )
+        else:
+            creds = self.client.derive_api_key()
+            if creds is None:
+                creds = self.client.create_api_key(int(time.time() * 1000))
+            self.client.set_api_creds(creds)
 
         self.logger = logging.getLogger(f"activity_runner_{id(self)}")
         self.logger.setLevel(logging.INFO)
@@ -137,6 +162,16 @@ class MarketActivityTracker:
         fh = logging.FileHandler(self.log_file, encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         self.logger.addHandler(fh)
+
+        try:
+            self.client.update_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL,
+                    signature_type=settings.pm_signature_type,
+                )
+            )
+        except Exception as exc:
+            self._debug("Collateral allowance sync", {"error": str(exc)})
 
     def clear_cache(self) -> None:
         save_json(
@@ -355,26 +390,36 @@ class MarketActivityTracker:
         items.sort(key=lambda x: x.timestamp, reverse=True)
         return items[: max(limit * 3, limit)]
 
-    def _extract_usdc_balance(self, payload: Any) -> float:
-        if isinstance(payload, dict):
-            raw_balance = payload.get("balance")
-            if raw_balance is None and "data" in payload and isinstance(payload["data"], dict):
-                raw_balance = payload["data"].get("balance")
-            if raw_balance is None:
-                return 0.0
-            try:
-                return float(raw_balance) / USDC_DECIMALS
-            except Exception:
-                try:
-                    return float(str(raw_balance))
-                except Exception:
-                    return 0.0
-        return 0.0
+    def _parse_usdc_collateral_balance(self, resp: Any) -> float:
+        """Match KNG4 prst1 ``_parse_balance_allowance``: micro-units vs human float."""
+        if isinstance(resp, dict):
+            raw = resp.get("balance")
+            if raw is None and isinstance(resp.get("data"), dict):
+                raw = resp["data"].get("balance")
+        else:
+            raw = getattr(resp, "balance", None) or resp
+        if raw is None or raw == "":
+            return 0.0
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        if v > 1_000_000:
+            return v / 1_000_000.0
+        return v
 
     def get_available_usdc_balance(self) -> float:
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=self.settings.pm_signature_type)
-        payload = self.client.get_balance_allowance(params=params)
-        return max(0.0, self._extract_usdc_balance(payload))
+        try:
+            payload = self.client.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.COLLATERAL,
+                    signature_type=self.settings.pm_signature_type,
+                )
+            )
+            return max(0.0, self._parse_usdc_collateral_balance(payload))
+        except Exception as exc:
+            self._debug("get_balance_allowance", {"error": str(exc)})
+            return 0.0
 
     def get_copy_buy_usd(self) -> float:
         """$1 flat when balance ≤ $200; above $200 use 0.75% of balance. Capped at balance (V2 min $1)."""
@@ -389,19 +434,67 @@ class MarketActivityTracker:
         amount = min(amount, balance)
         return int(amount * 100) / 100.0
 
+    def _partial_market_options(self, token_id: str) -> PartialCreateOrderOptions | None:
+        tick = None
+        neg = None
+        try:
+            tick = _norm_tick(self.client.get_tick_size(token_id))
+        except Exception:
+            pass
+        try:
+            neg = bool(self.client.get_neg_risk(token_id))
+        except Exception:
+            pass
+        if tick is None and neg is None:
+            self._debug("CLOB market options omitted", {"token_id": token_id[:24]})
+            return None
+        return PartialCreateOrderOptions(
+            tick_size=tick,
+            neg_risk=bool(neg) if neg is not None else None,
+        )
+
+    def _create_and_post_market_order(
+        self, margs: MarketOrderArgs, options: PartialCreateOrderOptions | None
+    ) -> Any:
+        create_and_post = getattr(self.client, "create_and_post_market_order", None)
+        if not callable(create_and_post):
+            raise RuntimeError("ClobClient.create_and_post_market_order missing (py_clob_client_v2 required)")
+        ot = margs.order_type or OrderType.FAK
+        try:
+            return create_and_post(margs, options=options, order_type=ot)
+        except TypeError:
+            return create_and_post(margs, options=options)
+
     def _build_market_order(self, trade: ActivityTrade, copy_buy_usd: float) -> MarketOrderArgs:
-        return MarketOrderArgs(token_id=trade.asset, amount=float(copy_buy_usd), side=BUY, order_type=OrderType.FOK)
+        return MarketOrderArgs(
+            token_id=trade.asset,
+            amount=float(copy_buy_usd),
+            side=Side.BUY,
+            price=0.0,
+            order_type=OrderType.FAK,
+        )
 
     def repeat_trade(self, trade: ActivityTrade, copy_buy_usd: float) -> dict:
         if copy_buy_usd <= 0:
             return {"ok": False, "message": "skipped: need at least $1 USDC for copy"}
-        if self.settings.dry_run:
-            order_args = self._build_market_order(trade, copy_buy_usd)
-            return {"ok": True, "message": f"DRY_RUN would place market BUY for {trade.title} / {trade.outcome}", "copied_usd": copy_buy_usd, "order_args": {"token_id": order_args.token_id, "amount": order_args.amount, "side": order_args.side, "order_type": str(order_args.order_type)}}
+        opts = self._partial_market_options(trade.asset)
         order_args = self._build_market_order(trade, copy_buy_usd)
-        signed = self.client.create_market_order(order_args)
-        resp = self.client.post_order(signed, OrderType.FOK)
-        return {"ok": True, "message": f"placed market BUY for {trade.title} / {trade.outcome}", "copied_usd": copy_buy_usd, "response": resp}
+        if self.settings.dry_run:
+            return {
+                "ok": True,
+                "message": f"DRY_RUN would place market BUY (FAK) for {trade.title} / {trade.outcome}",
+                "copied_usd": copy_buy_usd,
+                "order_args": {
+                    "token_id": order_args.token_id,
+                    "amount": order_args.amount,
+                    "side": str(order_args.side),
+                    "price": order_args.price,
+                    "order_type": str(order_args.order_type),
+                    "partial_options": str(opts) if opts else None,
+                },
+            }
+        resp = self._create_and_post_market_order(order_args, opts)
+        return {"ok": True, "message": f"placed market BUY (FAK) for {trade.title} / {trade.outcome}", "copied_usd": copy_buy_usd, "response": resp}
 
     def cycle(self, limit: int = 50) -> None:
         wallets = self.load_watch_wallets()
