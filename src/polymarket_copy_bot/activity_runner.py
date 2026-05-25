@@ -17,6 +17,7 @@ from py_clob_client_v2 import (
     BalanceAllowanceParams,
     ClobClient,
     MarketOrderArgs,
+    OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
     Side,
@@ -36,7 +37,9 @@ except Exception:
 HIGH_BALANCE_COPY_THRESHOLD_USD = 200.0
 COPY_BALANCE_FRACTION_ABOVE_THRESHOLD = 0.0075  # 0.75%
 MIN_MARKET_COPY_USD = 1.0
-CLEAR_CACHE_ON_RUN_START = True
+CLEAR_CACHE_ON_RUN_START = False
+LIMIT_COPY_PRICE = float(os.getenv("LIMIT_COPY_PRICE", "0.51"))
+LIMIT_COPY_SHARES = float(os.getenv("LIMIT_COPY_SHARES", "5"))
 
 # Same outcome token (contract): allow repeat buys after this cooldown (seconds).
 ASSET_BUY_COOLDOWN_SECONDS = 15 * 60
@@ -180,6 +183,7 @@ class MarketActivityTracker:
                 "forbidden_buy_markets": {},
                 "market_outcome_entries": {},
                 "asset_last_buy_ts": {},
+                "locked_windows": {},
             },
         )
 
@@ -192,6 +196,7 @@ class MarketActivityTracker:
                 "forbidden_buy_markets": {},
                 "market_outcome_entries": {},
                 "asset_last_buy_ts": {},
+                "locked_windows": {},
             },
         )
 
@@ -204,6 +209,8 @@ class MarketActivityTracker:
         cache["market_outcome_entries"] = entries if isinstance(entries, dict) else {}
         alt = cache.get("asset_last_buy_ts", {})
         cache["asset_last_buy_ts"] = alt if isinstance(alt, dict) else {}
+        locked = cache.get("locked_windows", {})
+        cache["locked_windows"] = locked if isinstance(locked, dict) else {}
         save_json(self.cache_file, cache)
 
     def _market_buy_key(self, title: str, outcome: str) -> str:
@@ -235,6 +242,19 @@ class MarketActivityTracker:
                 if title and self._is_active_title(title):
                     keep_entries[key] = payload
             cache["market_outcome_entries"] = keep_entries
+
+        locked = cache.get("locked_windows", {})
+        if not isinstance(locked, dict):
+            cache["locked_windows"] = {}
+        else:
+            keep_locked = {}
+            for key, payload in locked.items():
+                title = ""
+                if isinstance(payload, dict):
+                    title = str(payload.get("title") or "")
+                if title and self._is_active_title(title):
+                    keep_locked[key] = payload
+            cache["locked_windows"] = keep_locked
 
     def _debug(self, message: str, payload: Optional[dict] = None) -> None:
         if payload is None:
@@ -378,6 +398,34 @@ class MarketActivityTracker:
         now_et = self._now_et()
         return now_et.replace(month=month, day=day, hour=end_minutes // 60, minute=end_minutes % 60, second=0, microsecond=0)
 
+    def _window_lock_key(self, title: str) -> str:
+        return re.sub(r"\s+", " ", title.strip().lower())
+
+    def _is_window_locked(self, cache: dict, title: str) -> bool:
+        locked = cache.get("locked_windows", {})
+        if not isinstance(locked, dict):
+            cache["locked_windows"] = {}
+            return False
+        return self._window_lock_key(title) in locked
+
+    def _lock_window(self, cache: dict, trade: ActivityTrade, response: Any = None) -> None:
+        locked = cache.get("locked_windows", {})
+        locked_windows = dict(locked) if isinstance(locked, dict) else {}
+        payload = {
+            "title": trade.title,
+            "outcome": trade.outcome,
+            "asset": trade.asset,
+            "source_wallet": trade.wallet,
+            "source_key": trade.dedupe_key,
+            "locked_at": int(time.time()),
+            "price": LIMIT_COPY_PRICE,
+            "shares": LIMIT_COPY_SHARES,
+        }
+        if response is not None:
+            payload["response"] = self._to_serializable_response(response)
+        locked_windows[self._window_lock_key(trade.title)] = payload
+        cache["locked_windows"] = locked_windows
+
     def _is_fresh_trade(self, trade: ActivityTrade) -> bool:
         max_age = int(os.getenv("ACTIVITY_MAX_AGE_SECONDS", "3600"))
         return abs(int(time.time()) - trade.timestamp) <= max_age
@@ -425,8 +473,9 @@ class MarketActivityTracker:
             return None
         return ActivityTrade(wallet=wallet, asset=asset, title=title, outcome=outcome, side=side, size=size, price=price, timestamp=timestamp, amount=size * price, tx_hash=tx_hash, raw_id=raw_id)
 
-    def fetch_recent_wallet_activity(self, wallet: str, limit: int = 50) -> List[ActivityTrade]:
-        raw_activity = self.api.get_recent_activity(wallet, limit=limit)
+    def fetch_recent_wallet_activity(self, wallet: str, limit: int = 50, multiplier: int = 1) -> List[ActivityTrade]:
+        request_limit = max(limit * max(multiplier, 1), limit)
+        raw_activity = self.api.get_recent_activity(wallet, limit=request_limit)
         items: List[ActivityTrade] = []
         seen_ids: set[str] = set()
         for item in raw_activity:
@@ -441,7 +490,7 @@ class MarketActivityTracker:
             seen_ids.add(key)
             items.append(trade)
         items.sort(key=lambda x: x.timestamp, reverse=True)
-        return items[: max(limit * 3, limit)]
+        return items[:request_limit]
 
     def _parse_usdc_collateral_balance(self, resp: Any) -> float:
         """Match KNG4 prst1 ``_parse_balance_allowance``: micro-units vs human float."""
@@ -527,29 +576,37 @@ class MarketActivityTracker:
             order_type=OrderType.FAK,
         )
 
-    def repeat_trade(self, trade: ActivityTrade, copy_buy_usd: float) -> dict:
-        if copy_buy_usd <= 0:
-            return {"ok": False, "message": "skipped: need at least $1 USDC for copy"}
+    def _build_limit_order(self, trade: ActivityTrade) -> OrderArgs:
+        return OrderArgs(
+            token_id=trade.asset,
+            price=LIMIT_COPY_PRICE,
+            size=LIMIT_COPY_SHARES,
+            side=Side.BUY,
+        )
+
+    def repeat_trade(self, trade: ActivityTrade, copy_buy_usd: float = 0.0) -> dict:
         opts = self._partial_market_options(trade.asset)
-        order_args = self._build_market_order(trade, copy_buy_usd)
+        order_args = self._build_limit_order(trade)
+        copied_usd = LIMIT_COPY_PRICE * LIMIT_COPY_SHARES
         if self.settings.dry_run:
             return {
                 "ok": True,
-                "message": f"DRY_RUN would place market BUY (FAK) for {trade.title} / {trade.outcome}",
-                "copied_usd": copy_buy_usd,
+                "message": f"DRY_RUN would place limit BUY (GTC) for {trade.title} / {trade.outcome}",
+                "copied_usd": copied_usd,
                 "order_args": {
                     "token_id": order_args.token_id,
-                    "amount": order_args.amount,
+                    "size": order_args.size,
                     "side": str(order_args.side),
                     "price": order_args.price,
-                    "order_type": str(order_args.order_type),
+                    "order_type": str(OrderType.GTC),
                     "partial_options": str(opts) if opts else None,
                 },
             }
-        resp = self._create_and_post_market_order(order_args, opts)
-        return {"ok": True, "message": f"placed market BUY (FAK) for {trade.title} / {trade.outcome}", "copied_usd": copy_buy_usd, "response": resp}
+        signed_order = self.client.create_order(order_args, options=opts)
+        resp = self.client.post_order(signed_order, order_type=OrderType.GTC)
+        return {"ok": True, "message": f"placed limit BUY (GTC) for {trade.title} / {trade.outcome}", "copied_usd": copied_usd, "response": resp}
 
-    def cycle(self, limit: int = 50) -> None:
+    def cycle(self, limit: int = 50, activity_fetch_multiplier: int = 1) -> None:
         wallets = self.load_watch_wallets()
         if not wallets:
             raise RuntimeError("Watch list is empty. Add at least one wallet first.")
@@ -558,13 +615,12 @@ class MarketActivityTracker:
         self._prune_forbidden_buy_markets(cache)
         seen = set(str(x) for x in cache.get("seen", []))
         repeated = list(cache.get("repeated", []))
-        cycle_bought_assets: set[str] = set()
         candidates: List[ActivityTrade] = []
 
         skip_ended_title = os.getenv("ACTIVITY_SKIP_ENDED_TITLE_FILTER", "true").lower() in {"1", "true", "yes", "y", "on"}
 
         for wallet in wallets:
-            trades = self.fetch_recent_wallet_activity(wallet, limit=limit)
+            trades = self.fetch_recent_wallet_activity(wallet, limit=limit, multiplier=activity_fetch_multiplier)
             skipped_seen = skipped_fresh = skipped_title = 0
             for trade in trades:
                 if trade.dedupe_key in seen:
@@ -573,7 +629,7 @@ class MarketActivityTracker:
                 if not self._is_fresh_trade(trade):
                     skipped_fresh += 1
                     continue
-                if not skip_ended_title and not self._is_active_title(trade.title):
+                if skip_ended_title and not self._is_active_title(trade.title):
                     skipped_title += 1
                     continue
                 candidates.append(trade)
@@ -582,6 +638,7 @@ class MarketActivityTracker:
                 {
                     "wallet": wallet,
                     "parsed_buy_rows": len(trades),
+                    "activity_fetch_limit": limit * max(activity_fetch_multiplier, 1),
                     "skipped_seen": skipped_seen,
                     "skipped_fresh": skipped_fresh,
                     "skipped_ended_title": skipped_title,
@@ -589,30 +646,29 @@ class MarketActivityTracker:
                 },
             )
 
-        candidates.sort(key=lambda x: x.timestamp)
+        candidates.sort(key=lambda x: x.timestamp, reverse=True)
+        latest_by_window: dict[str, ActivityTrade] = {}
+        for trade in candidates:
+            latest_by_window.setdefault(self._window_lock_key(trade.title), trade)
+        candidates = sorted(latest_by_window.values(), key=lambda x: x.timestamp)
 
         if not candidates:
             self._save_cache(cache)
             return
 
         for trade in candidates:
-            if trade.asset in cycle_bought_assets:
-                self._debug("Skip same cycle asset", {"asset": trade.asset, "title": trade.title})
+            if self._is_window_locked(cache, trade.title):
+                self._debug("Skip locked window", {"asset": trade.asset, "title": trade.title, "outcome": trade.outcome})
                 continue
 
-            allowed_cd, cd_reason = self._can_buy_asset_after_cooldown(cache, trade.asset)
-            if not allowed_cd:
-                self._debug("Skip asset cooldown", {"asset": trade.asset, "title": trade.title, "reason": cd_reason})
-                continue
-
-            copy_buy_usd = self.get_copy_buy_usd()
+            copy_buy_usd = LIMIT_COPY_PRICE * LIMIT_COPY_SHARES
             ok = False
             message = ""
             used_copy_usd = copy_buy_usd
             result: dict = {}
 
             try:
-                result = self.repeat_trade(trade, copy_buy_usd)
+                result = self.repeat_trade(trade)
                 ok = bool(result.get("ok"))
                 message = str(result.get("message"))
                 used_copy_usd = float(result.get("copied_usd", copy_buy_usd))
@@ -637,10 +693,9 @@ class MarketActivityTracker:
 
             if ok:
                 seen.add(trade.dedupe_key)
-                cycle_bought_assets.add(trade.asset)
-                self._register_asset_buy_time(cache, trade.asset)
-                self._compact(f"[green]OPEN DEAL[/green] {trade.title} | {trade.outcome} | ${used_copy_usd:.2f}")
                 resp_obj = result.get("response") if isinstance(result, dict) else None
+                self._lock_window(cache, trade, response=None if self.settings.dry_run else resp_obj)
+                self._compact(f"[green]LIMIT ORDER[/green] {trade.title} | {trade.outcome} | {LIMIT_COPY_SHARES:g} @ {LIMIT_COPY_PRICE:.2f}")
                 self._log_copy_deal(
                     trade,
                     copied_usd=used_copy_usd,
@@ -675,9 +730,11 @@ class MarketActivityTracker:
             self._debug("Cache cleared on run start")
         followed = ", ".join(wallets) if wallets else "(none)"
         self._compact(f"[cyan]FOLLOWING[/cyan] {followed}")
+        first_cycle = True
         while True:
             try:
-                self.cycle(limit=limit)
+                self.cycle(limit=limit, activity_fetch_multiplier=3 if first_cycle else 1)
+                first_cycle = False
             except Exception as exc:
                 self._compact(f"[red]CYCLE_ERROR[/red] {exc}")
                 self._log_error("CYCLE_ERROR", str(exc), exc=exc)
@@ -699,7 +756,7 @@ def main() -> None:
     followed = ", ".join(wallets) if wallets else "(none)"
     tracker._compact(f"[cyan]FOLLOWING[/cyan] {followed}")
     if args.command == "once":
-        tracker.cycle(limit=args.limit)
+        tracker.cycle(limit=args.limit, activity_fetch_multiplier=3)
         return
     tracker.loop(limit=args.limit, clear_cache_on_start=CLEAR_CACHE_ON_RUN_START)
 
