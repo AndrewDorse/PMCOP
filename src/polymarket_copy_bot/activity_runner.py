@@ -16,7 +16,6 @@ from py_clob_client_v2 import (
     AssetType,
     BalanceAllowanceParams,
     ClobClient,
-    MarketOrderArgs,
     OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
@@ -33,16 +32,16 @@ try:
 except Exception:
     ET_TZ = timezone(timedelta(hours=-4))
 
-# V2-style sizing: flat $1 when balance ≤ threshold; above threshold use 0.75% of balance (capped at balance).
-HIGH_BALANCE_COPY_THRESHOLD_USD = 200.0
-COPY_BALANCE_FRACTION_ABOVE_THRESHOLD = 0.0075  # 0.75%
-MIN_MARKET_COPY_USD = 1.0
+# Fixed limit-order copy settings.
 CLEAR_CACHE_ON_RUN_START = False
 LIMIT_COPY_PRICE = float(os.getenv("LIMIT_COPY_PRICE", "0.51"))
 LIMIT_COPY_SHARES = float(os.getenv("LIMIT_COPY_SHARES", "5"))
-
-# Same outcome token (contract): allow repeat buys after this cooldown (seconds).
-ASSET_BUY_COOLDOWN_SECONDS = 15 * 60
+ACTIVITY_ALLOWED_TITLE_KEYWORDS = [
+    x.strip().lower()
+    for x in os.getenv("ACTIVITY_ALLOWED_TITLE_KEYWORDS", "bitcoin,btc").split(",")
+    if x.strip()
+]
+ACTIVITY_REQUIRED_WINDOW_MINUTES = int(os.getenv("ACTIVITY_REQUIRED_WINDOW_MINUTES", "5"))
 
 DEBUG_LOG_FILENAME = "activity_runner.log"
 
@@ -436,22 +435,15 @@ class MarketActivityTracker:
             return True
         return end_dt > self._now_et()
 
-    def _can_buy_asset_after_cooldown(self, cache: dict, asset: str) -> tuple[bool, str]:
-        raw = cache.get("asset_last_buy_ts", {})
-        if not isinstance(raw, dict):
-            cache["asset_last_buy_ts"] = {}
-            return True, ""
-        last_ts = int(raw.get(asset, 0) or 0)
-        now_ts = int(time.time())
-        if last_ts > 0 and now_ts - last_ts < ASSET_BUY_COOLDOWN_SECONDS:
-            return False, "asset_buy_cooldown"
-        return True, ""
-
-    def _register_asset_buy_time(self, cache: dict, asset: str) -> None:
-        raw = cache.get("asset_last_buy_ts", {})
-        times = dict(raw) if isinstance(raw, dict) else {}
-        times[asset] = int(time.time())
-        cache["asset_last_buy_ts"] = times
+    def _is_allowed_market_title(self, title: str) -> bool:
+        title_lc = title.lower()
+        if ACTIVITY_ALLOWED_TITLE_KEYWORDS and not any(keyword in title_lc for keyword in ACTIVITY_ALLOWED_TITLE_KEYWORDS):
+            return False
+        if ACTIVITY_REQUIRED_WINDOW_MINUTES > 0:
+            window_minutes = self._window_minutes_from_title(title)
+            if window_minutes != ACTIVITY_REQUIRED_WINDOW_MINUTES:
+                return False
+        return True
 
     def _extract_trade(self, wallet: str, raw: dict) -> Optional[ActivityTrade]:
         side = self._normalize_side(raw)
@@ -510,31 +502,9 @@ class MarketActivityTracker:
             return v / 1_000_000.0
         return v
 
-    def get_available_usdc_balance(self) -> float:
-        try:
-            payload = self.client.get_balance_allowance(
-                BalanceAllowanceParams(
-                    asset_type=AssetType.COLLATERAL,
-                    signature_type=self.settings.pm_signature_type,
-                )
-            )
-            return max(0.0, self._parse_usdc_collateral_balance(payload))
-        except Exception as exc:
-            self._debug("get_balance_allowance", {"error": str(exc)})
-            return 0.0
-
     def get_copy_buy_usd(self) -> float:
-        """$1 flat when balance ≤ $200; above $200 use 0.75% of balance. Capped at balance (V2 min $1)."""
-        balance = self.get_available_usdc_balance()
-        if balance < MIN_MARKET_COPY_USD:
-            self._debug("Insufficient USDC for $1 copy", {"balance": balance})
-            return 0.0
-        if balance <= HIGH_BALANCE_COPY_THRESHOLD_USD:
-            amount = MIN_MARKET_COPY_USD
-        else:
-            amount = balance * COPY_BALANCE_FRACTION_ABOVE_THRESHOLD
-        amount = min(amount, balance)
-        return int(amount * 100) / 100.0
+        """Return the fixed notional for the 5-share limit order."""
+        return LIMIT_COPY_PRICE * LIMIT_COPY_SHARES
 
     def _partial_market_options(self, token_id: str) -> PartialCreateOrderOptions | None:
         tick = None
@@ -553,27 +523,6 @@ class MarketActivityTracker:
         return PartialCreateOrderOptions(
             tick_size=tick,
             neg_risk=bool(neg) if neg is not None else None,
-        )
-
-    def _create_and_post_market_order(
-        self, margs: MarketOrderArgs, options: PartialCreateOrderOptions | None
-    ) -> Any:
-        create_and_post = getattr(self.client, "create_and_post_market_order", None)
-        if not callable(create_and_post):
-            raise RuntimeError("ClobClient.create_and_post_market_order missing (py_clob_client_v2 required)")
-        ot = margs.order_type or OrderType.FAK
-        try:
-            return create_and_post(margs, options=options, order_type=ot)
-        except TypeError:
-            return create_and_post(margs, options=options)
-
-    def _build_market_order(self, trade: ActivityTrade, copy_buy_usd: float) -> MarketOrderArgs:
-        return MarketOrderArgs(
-            token_id=trade.asset,
-            amount=float(copy_buy_usd),
-            side=Side.BUY,
-            price=0.0,
-            order_type=OrderType.FAK,
         )
 
     def _build_limit_order(self, trade: ActivityTrade) -> OrderArgs:
@@ -622,6 +571,7 @@ class MarketActivityTracker:
         for wallet in wallets:
             trades = self.fetch_recent_wallet_activity(wallet, limit=limit, multiplier=activity_fetch_multiplier)
             skipped_seen = skipped_fresh = skipped_title = 0
+            skipped_market = 0
             for trade in trades:
                 if trade.dedupe_key in seen:
                     skipped_seen += 1
@@ -631,6 +581,9 @@ class MarketActivityTracker:
                     continue
                 if skip_ended_title and not self._is_active_title(trade.title):
                     skipped_title += 1
+                    continue
+                if not self._is_allowed_market_title(trade.title):
+                    skipped_market += 1
                     continue
                 candidates.append(trade)
             self._debug(
@@ -642,6 +595,9 @@ class MarketActivityTracker:
                     "skipped_seen": skipped_seen,
                     "skipped_fresh": skipped_fresh,
                     "skipped_ended_title": skipped_title,
+                    "skipped_market_filter": skipped_market,
+                    "allowed_title_keywords": ACTIVITY_ALLOWED_TITLE_KEYWORDS,
+                    "required_window_minutes": ACTIVITY_REQUIRED_WINDOW_MINUTES,
                     "skip_ended_title_filter": skip_ended_title,
                 },
             )
@@ -730,6 +686,11 @@ class MarketActivityTracker:
             self._debug("Cache cleared on run start")
         followed = ", ".join(wallets) if wallets else "(none)"
         self._compact(f"[cyan]FOLLOWING[/cyan] {followed}")
+        self._compact(
+            f"[cyan]COPY SETTINGS[/cyan] limit BUY {LIMIT_COPY_SHARES:g} @ {LIMIT_COPY_PRICE:.2f}; "
+            f"keywords={','.join(ACTIVITY_ALLOWED_TITLE_KEYWORDS) or 'any'}; "
+            f"window={ACTIVITY_REQUIRED_WINDOW_MINUTES or 'any'}m"
+        )
         first_cycle = True
         while True:
             try:
@@ -754,8 +715,13 @@ def main() -> None:
     tracker = MarketActivityTracker(settings, Console())
     wallets = tracker.load_watch_wallets()
     followed = ", ".join(wallets) if wallets else "(none)"
-    tracker._compact(f"[cyan]FOLLOWING[/cyan] {followed}")
     if args.command == "once":
+        tracker._compact(f"[cyan]FOLLOWING[/cyan] {followed}")
+        tracker._compact(
+            f"[cyan]COPY SETTINGS[/cyan] limit BUY {LIMIT_COPY_SHARES:g} @ {LIMIT_COPY_PRICE:.2f}; "
+            f"keywords={','.join(ACTIVITY_ALLOWED_TITLE_KEYWORDS) or 'any'}; "
+            f"window={ACTIVITY_REQUIRED_WINDOW_MINUTES or 'any'}m"
+        )
         tracker.cycle(limit=args.limit, activity_fetch_multiplier=3)
         return
     tracker.loop(limit=args.limit, clear_cache_on_start=CLEAR_CACHE_ON_RUN_START)
