@@ -18,7 +18,7 @@ from py_clob_client_v2 import (
     AssetType,
     BalanceAllowanceParams,
     ClobClient,
-    MarketOrderArgs,
+    OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
     Side,
@@ -49,6 +49,7 @@ ACTIVITY_ALLOWED_TITLE_KEYWORDS = [
 ACTIVITY_REQUIRED_WINDOW_MINUTES = int(os.getenv("ACTIVITY_REQUIRED_WINDOW_MINUTES", "5"))
 COPY_SOURCE_USDC_MULTIPLIER = float(os.getenv("COPY_SOURCE_USDC_MULTIPLIER", "0.05"))
 MIN_COPY_USDC = float(os.getenv("MIN_COPY_USDC", "1.0"))
+MIN_COPY_SHARES = float(os.getenv("MIN_COPY_SHARES", "5.0"))
 MAX_COPY_USDC = float(os.getenv("MAX_COPY_USDC", "10.0"))
 MAX_COPY_USDC_PER_WINDOW = float(os.getenv("MAX_COPY_USDC_PER_WINDOW", "25.0"))
 MAX_COPY_USDC_PER_CYCLE = float(os.getenv("MAX_COPY_USDC_PER_CYCLE", "50.0"))
@@ -678,29 +679,16 @@ class MarketActivityTracker:
             neg_risk=bool(neg) if neg is not None else None,
         )
 
-    def _build_market_order(self, trade: ActivityTrade, copy_usdc: float, limit_price: float, available_balance: float) -> MarketOrderArgs:
-        return MarketOrderArgs(
+    def _build_limit_order(self, trade: ActivityTrade, shares: float, limit_price: float) -> OrderArgs:
+        return OrderArgs(
             token_id=trade.asset,
-            amount=float(copy_usdc),
-            side=Side.BUY,
             price=float(limit_price),
-            order_type=OrderType.FAK,
-            user_usdc_balance=float(available_balance),
+            size=float(shares),
+            side=Side.BUY,
         )
 
-    def _create_and_post_market_order(
-        self, margs: MarketOrderArgs, options: PartialCreateOrderOptions | None
-    ) -> Any:
-        create_and_post = getattr(self.client, "create_and_post_market_order", None)
-        if not callable(create_and_post):
-            raise RuntimeError("ClobClient.create_and_post_market_order missing (py_clob_client_v2 required)")
-        try:
-            return create_and_post(margs, options=options, order_type=OrderType.FAK)
-        except TypeError:
-            return create_and_post(margs, options=options)
-
-    def repeat_trade(self, trade: ActivityTrade, copy_buy_usd: float) -> dict:
-        opts = self._partial_market_options(trade.asset)
+    def _copy_order_plan(self, trade: ActivityTrade) -> dict:
+        target_usdc = self._copy_usdc_for_trade(trade)
         available_balance = self.get_cached_available_usdc_balance()
         best_ask = self._best_ask(trade.asset)
         if best_ask > MAX_COPY_ASK_PRICE:
@@ -708,32 +696,75 @@ class MarketActivityTracker:
                 "ok": False,
                 "message": f"skipped: best ask {best_ask:.4f} > max {MAX_COPY_ASK_PRICE:.4f}",
                 "copied_usd": 0.0,
+                "shares": 0.0,
                 "best_ask": best_ask,
             }
         limit_price = min(0.99, best_ask * (1 + ACTIVITY_BUY_SLIPPAGE_BPS / 10000.0))
-        order_args = self._build_market_order(trade, copy_buy_usd, limit_price, available_balance)
+        if available_balance < MIN_COPY_SHARES * limit_price:
+            return {
+                "ok": False,
+                "message": f"skipped: balance {available_balance:.2f} cannot buy min {MIN_COPY_SHARES:g} shares",
+                "copied_usd": 0.0,
+                "shares": 0.0,
+                "best_ask": best_ask,
+                "limit_price": limit_price,
+            }
+
+        desired_shares = max(MIN_COPY_SHARES, target_usdc / limit_price)
+        max_balance_shares = available_balance / limit_price
+        shares = min(desired_shares, max_balance_shares)
+        shares = int(shares * 100) / 100.0
+        if shares < MIN_COPY_SHARES:
+            return {
+                "ok": False,
+                "message": f"skipped: balance {available_balance:.2f} cannot buy min {MIN_COPY_SHARES:g} shares",
+                "copied_usd": 0.0,
+                "shares": 0.0,
+                "best_ask": best_ask,
+                "limit_price": limit_price,
+            }
+        copy_usdc = int(shares * limit_price * 100) / 100.0
+        return {
+            "ok": True,
+            "target_usdc": target_usdc,
+            "copied_usd": copy_usdc,
+            "shares": shares,
+            "best_ask": best_ask,
+            "limit_price": limit_price,
+            "available_balance": available_balance,
+        }
+
+    def repeat_trade(self, trade: ActivityTrade, plan: dict) -> dict:
+        opts = self._partial_market_options(trade.asset)
+        shares = float(plan["shares"])
+        limit_price = float(plan["limit_price"])
+        copied_usd = float(plan["copied_usd"])
+        order_args = self._build_limit_order(trade, shares, limit_price)
         if self.settings.dry_run:
             return {
                 "ok": True,
-                "message": f"DRY_RUN would place marketable BUY (FAK) for {trade.title} / {trade.outcome}",
-                "copied_usd": copy_buy_usd,
-                "best_ask": best_ask,
+                "message": f"DRY_RUN would place limit BUY (GTC) for {trade.title} / {trade.outcome}",
+                "copied_usd": copied_usd,
+                "shares": shares,
+                "best_ask": plan.get("best_ask"),
                 "limit_price": limit_price,
                 "order_args": {
                     "token_id": order_args.token_id,
-                    "amount": order_args.amount,
+                    "size": order_args.size,
                     "side": str(order_args.side),
                     "price": order_args.price,
-                    "order_type": str(order_args.order_type),
+                    "order_type": str(OrderType.GTC),
                     "partial_options": str(opts) if opts else None,
                 },
             }
-        resp = self._create_and_post_market_order(order_args, opts)
+        signed_order = self.client.create_order(order_args, options=opts)
+        resp = self.client.post_order(signed_order, order_type=OrderType.GTC)
         return {
             "ok": True,
-            "message": f"placed marketable BUY (FAK) for {trade.title} / {trade.outcome}",
-            "copied_usd": copy_buy_usd,
-            "best_ask": best_ask,
+            "message": f"placed limit BUY (GTC) for {trade.title} / {trade.outcome}",
+            "copied_usd": copied_usd,
+            "shares": shares,
+            "best_ask": plan.get("best_ask"),
             "limit_price": limit_price,
             "response": resp,
         }
@@ -747,6 +778,7 @@ class MarketActivityTracker:
         message: str = "",
         best_ask: Any = None,
         limit_price: Any = None,
+        shares: Any = None,
         response: Any = None,
     ) -> dict:
         row = {
@@ -763,6 +795,7 @@ class MarketActivityTracker:
             "source_price": trade.price,
             "source_size": trade.size,
             "copy_usdc": copy_usdc,
+            "copy_shares": shares,
             "order_status": order_status,
             "message": message,
             "best_ask": best_ask,
@@ -942,23 +975,58 @@ class MarketActivityTracker:
                 continue
 
             window_key = self._window_key(trade)
-            copy_buy_usd = self._copy_usdc_for_trade(trade)
+            try:
+                plan = self._copy_order_plan(trade)
+            except Exception as exc:
+                message = f"error: {exc}"
+                self._compact(f"[red]COPY_ORDER_FAILED[/red] {trade.title} | {exc}")
+                self._append_ledger(self._ledger_row(trade, 0.0, "failed", message=message))
+                self._register_copied_deal(cache, trade, copied_usd=0.0, result_ok=False)
+                self._log_error(
+                    "COPY_ORDER_FAILED",
+                    str(exc),
+                    payload={
+                        "source_wallet": trade.wallet,
+                        "title": trade.title,
+                        "outcome": trade.outcome,
+                        "asset": trade.asset,
+                    },
+                    exc=exc,
+                )
+                continue
+            copy_buy_usd = float(plan.get("copied_usd", 0.0))
+            if not bool(plan.get("ok")):
+                message = str(plan.get("message") or "skipped")
+                self._compact(f"[yellow]COPY_SKIPPED[/yellow] {trade.title} | {message}")
+                self._append_ledger(
+                    self._ledger_row(
+                        trade,
+                        copy_buy_usd,
+                        "skipped_ask" if "best ask" in message else "skipped_balance",
+                        message=message,
+                        best_ask=plan.get("best_ask"),
+                        limit_price=plan.get("limit_price"),
+                        shares=plan.get("shares"),
+                    )
+                )
+                self._register_copied_deal(cache, trade, copied_usd=0.0, result_ok=False)
+                continue
             if window_spend[window_key] + copy_buy_usd > MAX_COPY_USDC_PER_WINDOW:
                 message = "skipped: window cap"
                 self._compact(f"[yellow]COPY_SKIPPED[/yellow] {trade.title} | {message}")
-                self._append_ledger(self._ledger_row(trade, copy_buy_usd, "skipped_cap", message=message))
+                self._append_ledger(self._ledger_row(trade, copy_buy_usd, "skipped_cap", message=message, best_ask=plan.get("best_ask"), limit_price=plan.get("limit_price"), shares=plan.get("shares")))
                 self._register_copied_deal(cache, trade, copied_usd=0.0, result_ok=False)
                 continue
             if cycle_spend + copy_buy_usd > MAX_COPY_USDC_PER_CYCLE:
                 message = "skipped: cycle cap"
                 self._compact(f"[yellow]COPY_SKIPPED[/yellow] {trade.title} | {message}")
-                self._append_ledger(self._ledger_row(trade, copy_buy_usd, "skipped_cap", message=message))
+                self._append_ledger(self._ledger_row(trade, copy_buy_usd, "skipped_cap", message=message, best_ask=plan.get("best_ask"), limit_price=plan.get("limit_price"), shares=plan.get("shares")))
                 self._register_copied_deal(cache, trade, copied_usd=0.0, result_ok=False)
                 continue
             if day_spend + copy_buy_usd > MAX_COPY_USDC_PER_DAY:
                 message = "skipped: day cap"
                 self._compact(f"[yellow]COPY_SKIPPED[/yellow] {trade.title} | {message}")
-                self._append_ledger(self._ledger_row(trade, copy_buy_usd, "skipped_cap", message=message))
+                self._append_ledger(self._ledger_row(trade, copy_buy_usd, "skipped_cap", message=message, best_ask=plan.get("best_ask"), limit_price=plan.get("limit_price"), shares=plan.get("shares")))
                 self._register_copied_deal(cache, trade, copied_usd=0.0, result_ok=False)
                 continue
 
@@ -968,7 +1036,7 @@ class MarketActivityTracker:
             result: dict = {}
 
             try:
-                result = self.repeat_trade(trade, copy_buy_usd)
+                result = self.repeat_trade(trade, plan)
                 ok = bool(result.get("ok"))
                 message = str(result.get("message"))
                 used_copy_usd = float(result.get("copied_usd", copy_buy_usd))
@@ -989,7 +1057,7 @@ class MarketActivityTracker:
                     exc=exc,
                 )
 
-            status = "dry_run" if ok and self.settings.dry_run else ("matched" if ok else ("skipped_ask" if "best ask" in message else "failed"))
+            status = "dry_run" if ok and self.settings.dry_run else ("posted" if ok else ("skipped_ask" if "best ask" in message else "failed"))
             self._append_ledger(
                 self._ledger_row(
                     trade,
@@ -998,6 +1066,7 @@ class MarketActivityTracker:
                     message=message,
                     best_ask=result.get("best_ask") if isinstance(result, dict) else None,
                     limit_price=result.get("limit_price") if isinstance(result, dict) else None,
+                    shares=result.get("shares") if isinstance(result, dict) else None,
                     response=result.get("response") if isinstance(result, dict) else None,
                 )
             )
@@ -1010,7 +1079,7 @@ class MarketActivityTracker:
                 cycle_spend += used_copy_usd
                 day_spend += used_copy_usd
                 resp_obj = result.get("response") if isinstance(result, dict) else None
-                self._compact(f"[green]FAK BUY[/green] {trade.title} | {trade.outcome} | ${used_copy_usd:.2f}")
+                self._compact(f"[green]LIMIT BUY[/green] {trade.title} | {trade.outcome} | {result.get('shares', 0):g} @ {result.get('limit_price', 0):.4f} | ${used_copy_usd:.2f}")
                 self._log_copy_deal(
                     trade,
                     copied_usd=used_copy_usd,
@@ -1046,8 +1115,8 @@ class MarketActivityTracker:
         followed = ", ".join(wallets) if wallets else "(none)"
         self._compact(f"[cyan]FOLLOWING[/cyan] {followed}")
         self._compact(
-            f"[cyan]COPY SETTINGS[/cyan] FAK BUY source_mult={COPY_SOURCE_USDC_MULTIPLIER:g}; "
-            f"min=${MIN_COPY_USDC:g}; max=${MAX_COPY_USDC:g}; window_cap=${MAX_COPY_USDC_PER_WINDOW:g}; "
+            f"[cyan]COPY SETTINGS[/cyan] LIMIT BUY source_mult={COPY_SOURCE_USDC_MULTIPLIER:g}; "
+            f"min_shares={MIN_COPY_SHARES:g}; min=${MIN_COPY_USDC:g}; max=${MAX_COPY_USDC:g}; window_cap=${MAX_COPY_USDC_PER_WINDOW:g}; "
             f"cycle_cap=${MAX_COPY_USDC_PER_CYCLE:g}; day_cap=${MAX_COPY_USDC_PER_DAY:g}; "
             f"assets={','.join(ACTIVITY_ALLOWED_ASSETS) or 'any'}; window={ACTIVITY_REQUIRED_WINDOW_MINUTES or 'any'}m; "
             f"max_ask={MAX_COPY_ASK_PRICE:g}; slippage_bps={ACTIVITY_BUY_SLIPPAGE_BPS}; auth={self.auth_mode}"
@@ -1082,8 +1151,8 @@ def main() -> None:
     if args.command == "once":
         tracker._compact(f"[cyan]FOLLOWING[/cyan] {followed}")
         tracker._compact(
-            f"[cyan]COPY SETTINGS[/cyan] FAK BUY source_mult={COPY_SOURCE_USDC_MULTIPLIER:g}; "
-            f"min=${MIN_COPY_USDC:g}; max=${MAX_COPY_USDC:g}; window_cap=${MAX_COPY_USDC_PER_WINDOW:g}; "
+            f"[cyan]COPY SETTINGS[/cyan] LIMIT BUY source_mult={COPY_SOURCE_USDC_MULTIPLIER:g}; "
+            f"min_shares={MIN_COPY_SHARES:g}; min=${MIN_COPY_USDC:g}; max=${MAX_COPY_USDC:g}; window_cap=${MAX_COPY_USDC_PER_WINDOW:g}; "
             f"cycle_cap=${MAX_COPY_USDC_PER_CYCLE:g}; day_cap=${MAX_COPY_USDC_PER_DAY:g}; "
             f"assets={','.join(ACTIVITY_ALLOWED_ASSETS) or 'any'}; window={ACTIVITY_REQUIRED_WINDOW_MINUTES or 'any'}m; "
             f"max_ask={MAX_COPY_ASK_PRICE:g}; slippage_bps={ACTIVITY_BUY_SLIPPAGE_BPS}; auth={tracker.auth_mode}"
