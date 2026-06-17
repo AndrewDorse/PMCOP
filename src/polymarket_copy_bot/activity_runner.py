@@ -700,29 +700,10 @@ class MarketActivityTracker:
                 "best_ask": best_ask,
             }
         limit_price = min(0.99, best_ask * (1 + ACTIVITY_BUY_SLIPPAGE_BPS / 10000.0))
-        if available_balance < MIN_COPY_SHARES * limit_price:
-            return {
-                "ok": False,
-                "message": f"skipped: balance {available_balance:.2f} cannot buy min {MIN_COPY_SHARES:g} shares",
-                "copied_usd": 0.0,
-                "shares": 0.0,
-                "best_ask": best_ask,
-                "limit_price": limit_price,
-            }
-
         desired_shares = max(MIN_COPY_SHARES, target_usdc / limit_price)
-        max_balance_shares = available_balance / limit_price
-        shares = min(desired_shares, max_balance_shares)
+        balance_shares = available_balance / limit_price if limit_price > 0 else 0.0
+        shares = desired_shares if balance_shares >= desired_shares else MIN_COPY_SHARES
         shares = int(shares * 100) / 100.0
-        if shares < MIN_COPY_SHARES:
-            return {
-                "ok": False,
-                "message": f"skipped: balance {available_balance:.2f} cannot buy min {MIN_COPY_SHARES:g} shares",
-                "copied_usd": 0.0,
-                "shares": 0.0,
-                "best_ask": best_ask,
-                "limit_price": limit_price,
-            }
         copy_usdc = int(shares * limit_price * 100) / 100.0
         return {
             "ok": True,
@@ -1002,7 +983,7 @@ class MarketActivityTracker:
                     self._ledger_row(
                         trade,
                         copy_buy_usd,
-                        "skipped_ask" if "best ask" in message else "skipped_balance",
+                        "skipped_ask" if "best ask" in message else "skipped_plan",
                         message=message,
                         best_ask=plan.get("best_ask"),
                         limit_price=plan.get("limit_price"),
