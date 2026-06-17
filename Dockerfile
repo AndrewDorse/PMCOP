@@ -21,5 +21,5 @@ RUN chmod +x /docker-entrypoint.sh
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 # activity_runner: PYTHONPATH=/app/src — module name is polymarket_copy_bot (not polymymarket_*).
-# Activity feed: copy BUYs as one locked 5-share limit order per window. Position-sync: cli run
+# Activity feed: copy fresh source BUY deals as capped FAK orders. Position-sync: cli run
 CMD ["python", "-m", "polymarket_copy_bot.activity_runner", "run", "--limit", "50"]
