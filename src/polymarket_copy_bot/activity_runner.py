@@ -691,15 +691,17 @@ class MarketActivityTracker:
         target_usdc = self._copy_usdc_for_trade(trade)
         available_balance = self.get_cached_available_usdc_balance()
         best_ask = self._best_ask(trade.asset)
-        if best_ask > MAX_COPY_ASK_PRICE:
+        source_price = max(0.01, min(0.99, trade.price))
+        if source_price > MAX_COPY_ASK_PRICE:
             return {
                 "ok": False,
-                "message": f"skipped: best ask {best_ask:.4f} > max {MAX_COPY_ASK_PRICE:.4f}",
+                "message": f"skipped: source price {source_price:.4f} > max {MAX_COPY_ASK_PRICE:.4f}",
                 "copied_usd": 0.0,
                 "shares": 0.0,
                 "best_ask": best_ask,
+                "source_price": source_price,
             }
-        limit_price = min(0.99, best_ask * (1 + ACTIVITY_BUY_SLIPPAGE_BPS / 10000.0))
+        limit_price = source_price
         desired_shares = max(MIN_COPY_SHARES, target_usdc / limit_price)
         balance_shares = available_balance / limit_price if limit_price > 0 else 0.0
         shares = desired_shares if balance_shares >= desired_shares else MIN_COPY_SHARES
@@ -711,6 +713,7 @@ class MarketActivityTracker:
             "copied_usd": copy_usdc,
             "shares": shares,
             "best_ask": best_ask,
+            "source_price": source_price,
             "limit_price": limit_price,
             "available_balance": available_balance,
         }
@@ -983,7 +986,7 @@ class MarketActivityTracker:
                     self._ledger_row(
                         trade,
                         copy_buy_usd,
-                        "skipped_ask" if "best ask" in message else "skipped_plan",
+                        "skipped_price" if "price" in message else "skipped_plan",
                         message=message,
                         best_ask=plan.get("best_ask"),
                         limit_price=plan.get("limit_price"),
@@ -1038,7 +1041,7 @@ class MarketActivityTracker:
                     exc=exc,
                 )
 
-            status = "dry_run" if ok and self.settings.dry_run else ("posted" if ok else ("skipped_ask" if "best ask" in message else "failed"))
+            status = "dry_run" if ok and self.settings.dry_run else ("posted" if ok else ("skipped_price" if "price" in message else "failed"))
             self._append_ledger(
                 self._ledger_row(
                     trade,
